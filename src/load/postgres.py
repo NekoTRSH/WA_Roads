@@ -211,7 +211,6 @@ def load_to_postgis(gdf: gpd.GeoDataFrame, engine) -> int:
 
     return len(df)
 
-
 def main() -> None:
     parquet_path = latest_parquet_file(SILVER_DIR)
     gdf = read_roads(parquet_path)
