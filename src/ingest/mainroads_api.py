@@ -8,7 +8,10 @@ from pathlib import Path
 import geopandas as gpd
 import pandas as pd
 import requests
+from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+
+load_dotenv()
 
 LAYER_URL = os.getenv(
     "MAINROADS_ROAD_NETWORK_URL",
