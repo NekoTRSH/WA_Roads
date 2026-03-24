@@ -5,11 +5,25 @@ from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
+from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
 
+load_dotenv()
+
 SILVER_DIR = Path(os.getenv("SILVER_DIR", "data/silver"))
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://wa_admin:change_me@localhost:5432/wa_roads")
+
+
+def default_database_url() -> str:
+    user = os.getenv("POSTGRES_USER", "wa_admin")
+    password = os.getenv("POSTGRES_PASSWORD", "change_me")
+    db = os.getenv("POSTGRES_DB", "wa_roads")
+    host = os.getenv("POSTGRES_HOST", "localhost")
+    port = os.getenv("POSTGRES_PORT", "5432")
+    return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}"
+
+
+DATABASE_URL = os.getenv("DATABASE_URL", default_database_url())
 TARGET_TABLE = "core.road_segment"
 
 ########################################################
