@@ -4,10 +4,8 @@ import os
 from pathlib import Path
 
 import geopandas as gpd
-import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
-
 
 load_dotenv()
 
@@ -28,6 +26,7 @@ TARGET_TABLE = "core.road_segment"
 
 ########################################################
 
+
 # Finds most recent road_network.paraquet file and return the path
 # For automatically loading the latest silver output
 def latest_parquet_file(directory: Path) -> Path:
@@ -35,6 +34,7 @@ def latest_parquet_file(directory: Path) -> Path:
     if not files:
         raise FileNotFoundError(f"No parquet files found in {directory}")
     return files[-1]
+
 
 # Reads the paraquet into a GeoDataFrame, ensuring CRS is set to EPSG:4283, if missing derive geom_3875 and length_m
 # For consistent, load-ready roads dataset regardless of what CRS metadata says in the parquet
@@ -52,6 +52,7 @@ def read_roads(parquet_path: Path) -> gpd.GeoDataFrame:
     gdf["length_m"] = gdf["geom_3857"].length
 
     return gdf
+
 
 # Lowercase all column names and has an "expected" schema, missing columns will be "none"
 # For making the load step easy even when fields change or are absent
@@ -97,11 +98,13 @@ def normalize_columns(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     gdf = gdf[expected]
     return gdf
 
+
 # Executes TRUNCATE TABLE inside transaction for full refresh load
 def truncate_target(engine) -> None:
     sql = text("TRUNCATE TABLE core.road_segment;")
     with engine.begin() as conn:
         conn.execute(sql)
+
 
 # Loads the GeoDataFrame into core.road_segment row-by-row, builds geom_4283 from geometry
 # computes a 3857 version, converts both geometries to WKT, and inserts
@@ -218,12 +221,13 @@ def load_to_postgis(gdf: gpd.GeoDataFrame, engine) -> int:
     )
 
     with engine.begin() as conn:
-        for rec, wkt_4283, wkt_3857 in zip(records, geom_4283_wkt, geom_3857_wkt):
+        for rec, wkt_4283, wkt_3857 in zip(records, geom_4283_wkt, geom_3857_wkt, strict=True):
             rec["geom_4283_wkt"] = wkt_4283
             rec["geom_3857_wkt"] = wkt_3857
             conn.execute(insert_sql, rec)
 
     return len(df)
+
 
 def main() -> None:
     parquet_path = latest_parquet_file(SILVER_DIR)
