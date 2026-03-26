@@ -15,7 +15,7 @@ load_dotenv()
 
 LAYER_URL = os.getenv(
     "MAINROADS_ROAD_NETWORK_URL",
-    "https://gisservices.mainroads.wa.gov.au/arcgis/rest/services/OpenData/RoadAssets_DataPortal/MapServer/17"
+    "https://gisservices.mainroads.wa.gov.au/arcgis/rest/services/OpenData/RoadAssets_DataPortal/MapServer/17",
 )
 
 RAW_DIR = Path(os.getenv("RAW_ROAD_DIR", "data/raw/road_network"))
@@ -28,16 +28,19 @@ session = requests.Session()
 
 ########################################################
 
+
 # Return UTC time in the format of YYYYMMDDHHMMSSZ
 # For timestamps in filenames, logging etc
 def utc_now_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
 
 # Create raw and silver data directories if it doesn't exist
 # To prevent file-write failures later in the pipeline and nested paths are created properly
 def ensure_dirs() -> None:
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     SILVER_DIR.mkdir(parents=True, exist_ok=True)
+
 
 # Send HTTP GET to ArcGIS layer endpoint and retorn parsed JSON
 # All queries share one path for timeout/error handling and session reuse
@@ -46,17 +49,13 @@ def query_json(params: dict) -> dict:
     response.raise_for_status()
     return response.json()
 
+
 # Calls query_json() with ArcGIS parameters to return total feature count and convert to int
 # For pagination
 def get_total_count() -> int:
-    payload = query_json(
-        {
-            "where": "1=1",
-            "returnCountOnly": "true",
-            "f": "json"
-        }
-    )
+    payload = query_json({"where": "1=1", "returnCountOnly": "true", "f": "json"})
     return int(payload["count"])
+
 
 # Calls Main Roads ArcGIS "query" endpoint returns one page of road network features
 # Also for pagination, able to pull whole layers in chunks wihtout timing out or loading all at once
@@ -78,7 +77,8 @@ def fetch_batch(offset: int, batch_size: int) -> dict:
     response.raise_for_status()
     return response.json()
 
-# Write raw JSON response for a batch to disk 
+
+# Write raw JSON response for a batch to disk
 # For provenance (can recheck excatly what the API returned per batch) and to download from transform
 def save_raw_payload(payload: dict, run_id: str, batch_number: int) -> Path:
     run_dir = RAW_DIR / run_id
@@ -87,6 +87,7 @@ def save_raw_payload(payload: dict, run_id: str, batch_number: int) -> Path:
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f)
     return output_path
+
 
 # Converts GeoJSON features aarray into GeoDataFrame in EPSG:4283, normalises columns and perserve ids
 # For turning API JSON into something that can be analysed
@@ -106,8 +107,9 @@ def geojson_to_gdf(payload: dict) -> gpd.GeoDataFrame:
 
     return gdf
 
+
 # Coordinates the whole paginated pull, get total feature count, loops offsets in BATCH_SIZE,
-# fetches each batch, saves raw JSON, convert batch to GeoDataFrame. 
+# fetches each batch, saves raw JSON, convert batch to GeoDataFrame.
 # This is the ingest + assemble step and returns both the combined data and the list of raw files
 def build_run_dataframe(run_id: str) -> tuple[gpd.GeoDataFrame, list[Path]]:
     total_count = get_total_count()
@@ -135,6 +137,7 @@ def build_run_dataframe(run_id: str) -> tuple[gpd.GeoDataFrame, list[Path]]:
     gdf = gpd.GeoDataFrame(combined, geometry="geometry", crs="EPSG:4283")
     return gdf, raw_files
 
+
 # Adds fields that are computed to EPSG:3857 and calculates length_m from the geometry
 # For adding convienent attribute. Note that EPS:3857 is an approximation
 def add_derived_columns(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -146,6 +149,7 @@ def add_derived_columns(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     gdf["length_m"] = gdf["geom_3857"].length
     return gdf
 
+
 # Saves the (silver) file dataset to the SILVER_DIR
 # For producing compact, columnar file which are fast to read downstream
 def save_parquet(gdf: gpd.GeoDataFrame, run_id: str) -> Path:
@@ -153,9 +157,17 @@ def save_parquet(gdf: gpd.GeoDataFrame, run_id: str) -> Path:
     gdf.to_parquet(output_path, index=False)
     return output_path
 
-# Inserts a run record into audit.pipeline_runs (Postgres) with statys counts etc... 
-# For operational observability, can track successes and failures and what was produced 
-def write_audit_row(engine, run_id: str, status: str, rows_fetched: int, files_written: int, error_message: str | None = None) -> None:
+
+# Inserts a run record into audit.pipeline_runs (Postgres) with statys counts etc...
+# For operational observability, can track successes and failures and what was produced
+def write_audit_row(
+    engine,
+    run_id: str,
+    status: str,
+    rows_fetched: int,
+    files_written: int,
+    error_message: str | None = None,
+) -> None:
     sql = text(
         """
         INSERT INTO audit.pipeline_runs (
@@ -197,7 +209,9 @@ def write_audit_row(engine, run_id: str, status: str, rows_fetched: int, files_w
 
 def main() -> None:
     ensure_dirs()
-    run_id = os.getenv("RUN_ID", None) or str(pd.util.hash_pandas_object(pd.Series([utc_now_str()])).astype(str).iloc[0])
+    run_id = os.getenv("RUN_ID", None) or str(
+        pd.util.hash_pandas_object(pd.Series([utc_now_str()])).astype(str).iloc[0]
+    )
 
     if len(run_id) < 32:
         run_id = "00000000-0000-0000-0000-" + utc_now_str().replace("T", "").replace("Z", "")[-12:]

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-import json
 import os
+import re
 
+import branca.colormap as cm
 import folium
 import pandas as pd
 import plotly.express as px
+import requests
 import streamlit as st
 from dotenv import load_dotenv
+from shapely.geometry import mapping, shape
+from shapely.ops import unary_union
 from sqlalchemy import create_engine, text
 from streamlit_folium import st_folium
 
@@ -31,6 +35,10 @@ def default_database_url() -> str:
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", default_database_url())
+WA_LGA_BOUNDARIES_URL = os.getenv(
+    "WA_LGA_BOUNDARIES_URL",
+    "https://geo.abs.gov.au/arcgis/rest/services/ASGS2021/LGA_2021/FeatureServer/0",
+)
 
 
 @st.cache_resource
@@ -158,64 +166,90 @@ def load_filtered_lga_stats(stat_date: str, selected_networks: list[str]) -> pd.
 
 
 @st.cache_data(ttl=300)
-def load_map_segments(
-    lg_name: str | None,
-    network_type: str | None,
-    limit: int = 500
-) -> pd.DataFrame:
-    filters = []
-    params = {"limit": limit}
-
-    if lg_name and lg_name != "All":
-        filters.append("lg_name = :lg_name")
-        params["lg_name"] = lg_name
-
-    if network_type and network_type != "All":
-        filters.append("network_type = :network_type")
-        params["network_type"] = network_type
-
-    where_clause = " AND ".join(filters)
-    if where_clause:
-        where_clause = "WHERE " + where_clause
-
-    sql = text(
-        f"""
-        SELECT
-            source_objectid,
-            COALESCE(road_name, 'Unknown') AS road_name,
-            COALESCE(network_type, 'Unknown') AS network_type,
-            COALESCE(lg_name, 'Unknown') AS lg_name,
-            ST_AsGeoJSON(geom_4283) AS geom_geojson
-        FROM core.road_segment
-        {where_clause}
-        ORDER BY source_objectid
-        LIMIT :limit
-        """
+def load_wa_lga_boundaries() -> dict:
+    response = requests.get(
+        f"{WA_LGA_BOUNDARIES_URL}/query",
+        params={
+            "where": "STE_CODE21='5'",
+            "outFields": "LGA_CODE21,LGA_NAME21",
+            "returnGeometry": "true",
+            "outSR": "4326",
+            "f": "geojson",
+        },
+        timeout=60,
     )
+    response.raise_for_status()
+    payload = response.json()
 
-    with get_engine().connect() as conn:
-        df = pd.read_sql(sql, conn, params=params)
-    return df
+    if payload.get("type") != "FeatureCollection":
+        raise ValueError("Boundary API did not return GeoJSON FeatureCollection.")
+
+    return payload
 
 
-def build_feature_collection(df: pd.DataFrame) -> dict:
+def normalize_lga_code(value: object) -> str:
+    if value is None:
+        return ""
+    digits = re.sub(r"\D", "", str(value))
+    return digits.lstrip("0") or "0" if digits else ""
+
+
+def normalize_lga_name(value: object) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"[^A-Z0-9]", "", str(value).upper())
+
+
+def build_lga_choropleth_feature_collection(
+    boundaries_geojson: dict,
+    lga_stats: pd.DataFrame,
+) -> dict:
+    stats_by_code: dict[str, dict] = {}
+    stats_by_name: dict[str, dict] = {}
+
+    for _, row in lga_stats.iterrows():
+        metrics = {
+            "lg_no": str(row.get("lg_no", "")),
+            "lg_name": str(row.get("lg_name", "Unknown")),
+            "segment_count": int(row.get("segment_count", 0) or 0),
+            "total_length_km": float(row.get("total_length_km", 0) or 0),
+        }
+
+        code_key = normalize_lga_code(row.get("lg_no"))
+        name_key = normalize_lga_name(row.get("lg_name"))
+        if code_key:
+            stats_by_code[code_key] = metrics
+        if name_key:
+            stats_by_name[name_key] = metrics
+
     features = []
-    for _, row in df.iterrows():
-        if not row["geom_geojson"]:
-            continue
-        geometry = json.loads(row["geom_geojson"])
+    for feature in boundaries_geojson.get("features", []):
+        props = feature.get("properties", {})
+        boundary_code = normalize_lga_code(props.get("LGA_CODE21"))
+        boundary_name = normalize_lga_name(props.get("LGA_NAME21"))
+
+        matched = stats_by_code.get(boundary_code) or stats_by_name.get(boundary_name)
+        if matched is None:
+            matched = {
+                "lg_no": props.get("LGA_CODE21", ""),
+                "lg_name": props.get("LGA_NAME21", "Unknown"),
+                "segment_count": 0,
+                "total_length_km": 0.0,
+            }
+
         features.append(
             {
                 "type": "Feature",
-                "geometry": geometry,
+                "geometry": feature.get("geometry"),
                 "properties": {
-                    "road_name": row["road_name"],
-                    "network_type": row["network_type"],
-                    "lg_name": row["lg_name"],
-                    "source_objectid": row["source_objectid"],
+                    "lg_no": matched["lg_no"],
+                    "lg_name": matched["lg_name"],
+                    "segment_count": matched["segment_count"],
+                    "total_length_km": matched["total_length_km"],
                 },
             }
         )
+
     return {"type": "FeatureCollection", "features": features}
 
 
@@ -223,20 +257,20 @@ def compute_map_center(feature_collection: dict) -> tuple[float, float]:
     lats = []
     lons = []
 
+    def walk_coordinates(node):
+        if isinstance(node, list):
+            if node and isinstance(node[0], (int, float)) and len(node) >= 2:
+                lon, lat = node[0], node[1]
+                lons.append(lon)
+                lats.append(lat)
+                return
+            for child in node:
+                walk_coordinates(child)
+
     for feature in feature_collection.get("features", []):
         geom = feature.get("geometry", {})
         coords = geom.get("coordinates", [])
-        geom_type = geom.get("type")
-
-        if geom_type == "LineString":
-            for lon, lat, *_ in coords:
-                lons.append(lon)
-                lats.append(lat)
-        elif geom_type == "MultiLineString":
-            for line in coords:
-                for lon, lat, *_ in line:
-                    lons.append(lon)
-                    lats.append(lat)
+        walk_coordinates(coords)
 
     if not lats or not lons:
         return -25.2744, 122.0
@@ -244,41 +278,68 @@ def compute_map_center(feature_collection: dict) -> tuple[float, float]:
     return sum(lats) / len(lats), sum(lons) / len(lons)
 
 
-def network_color(value: str) -> str:
-    palette = {
-        "State Road": "#00C5FF",
-        "Local Road": "#CCCCCC",
-        "Main Roads Controlled Path": "#C500FF",
-        "Miscellaneous Road": "#FFAA00",
-        "Crossover": "#000000",
-        "Unknown": "#666666",
-    }
-    return palette.get(value, "#666666")
-
-
 def make_map(feature_collection: dict) -> folium.Map:
     center_lat, center_lon = compute_map_center(feature_collection)
     m = folium.Map(location=[center_lat, center_lon], zoom_start=6, tiles="CartoDB positron")
 
+    lengths = [
+        float(f.get("properties", {}).get("total_length_km", 0) or 0)
+        for f in feature_collection.get("features", [])
+    ]
+    max_length = max(lengths) if lengths else 0.0
+    scale_max = max(max_length, 1.0)
+    colormap = cm.linear.YlGnBu_09.scale(0, scale_max)
+    colormap.caption = "Total road length (km)"
+
     def style_fn(feature):
-        net = feature["properties"].get("network_type", "Unknown")
+        value = float(feature["properties"].get("total_length_km", 0) or 0)
+        if value <= 0:
+            return {
+                "fillColor": "#f2f2f2",
+                "color": "#8a8a8a",
+                "weight": 0.8,
+                "fillOpacity": 0.45,
+            }
         return {
-            "color": network_color(net),
-            "weight": 2,
-            "opacity": 0.9,
+            "fillColor": colormap(value),
+            "color": "#4f4f4f",
+            "weight": 0.8,
+            "fillOpacity": 0.72,
         }
 
     folium.GeoJson(
         feature_collection,
         style_function=style_fn,
+        highlight_function=lambda _: {"weight": 2, "color": "#111111", "fillOpacity": 0.9},
         tooltip=folium.GeoJsonTooltip(
-            fields=["road_name", "network_type", "lg_name", "source_objectid"],
-            aliases=["Road", "Network type", "LGA", "ObjectID"],
+            fields=["lg_name", "lg_no", "total_length_km", "segment_count"],
+            aliases=["LGA", "LGA code", "Road length (km)", "Segment count"],
             localize=True,
             sticky=False,
         ),
-        name="Road segments",
+        name="LGA choropleth",
     ).add_to(m)
+
+    # Dissolve LGAs to show the WA state outline as a distinct boundary layer.
+    shapes = [
+        shape(f["geometry"])
+        for f in feature_collection.get("features", [])
+        if f.get("geometry")
+    ]
+    if shapes:
+        wa_outline = mapping(unary_union(shapes))
+        folium.GeoJson(
+            {"type": "Feature", "geometry": wa_outline, "properties": {"name": "Western Australia"}},
+            style_function=lambda _: {
+                "fillOpacity": 0,
+                "color": "#000000",
+                "weight": 2.5,
+                "opacity": 1,
+            },
+            name="WA boundary",
+        ).add_to(m)
+
+    colormap.add_to(m)
 
     folium.LayerControl().add_to(m)
     return m
@@ -317,9 +378,6 @@ def main():
 
     map_network_options = ["All"] + network_options
     selected_map_network = st.sidebar.selectbox("Map network type", map_network_options, index=0)
-
-    st.sidebar.markdown("---")
-    map_limit = st.sidebar.slider("Map segment sample", min_value=50, max_value=1500, value=500, step=50)
 
     if selected_lga != "All":
         lga_summary_view = lga_summary[lga_summary["lg_name"] == selected_lga].copy()
@@ -395,17 +453,13 @@ def main():
     )
     st.dataframe(top_roads, use_container_width=True, hide_index=True)
 
-    st.subheader("Sample road map")
-    map_df = load_map_segments(
-        lg_name=None if selected_lga == "All" else selected_lga,
-        network_type=None if selected_map_network == "All" else selected_map_network,
-        limit=map_limit,
-    )
-
-    if map_df.empty:
-        st.info("No road segments found for the selected map filters.")
+    st.subheader("LGA road-length choropleth")
+    try:
+        wa_boundaries = load_wa_lga_boundaries()
+    except Exception as exc:
+        st.error(f"Could not load WA LGA boundaries: {exc}")
     else:
-        feature_collection = build_feature_collection(map_df)
+        feature_collection = build_lga_choropleth_feature_collection(wa_boundaries, lga_summary_view)
         road_map = make_map(feature_collection)
         st_folium(road_map, width=None, height=650)
 
