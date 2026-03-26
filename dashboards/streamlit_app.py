@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import re
+from pathlib import Path
 
 import branca.colormap as cm
 import folium
@@ -14,7 +16,6 @@ from shapely.geometry import mapping, shape
 from shapely.ops import unary_union
 from sqlalchemy import create_engine, text
 from streamlit_folium import st_folium
-
 
 load_dotenv()
 
@@ -37,8 +38,9 @@ def default_database_url() -> str:
 DATABASE_URL = os.getenv("DATABASE_URL", default_database_url())
 WA_LGA_BOUNDARIES_URL = os.getenv(
     "WA_LGA_BOUNDARIES_URL",
-    "https://geo.abs.gov.au/arcgis/rest/services/ASGS2021/LGA_2021/FeatureServer/0",
+    "https://geo.abs.gov.au/arcgis/rest/services/ASGS2024/LGA/FeatureServer/0",
 )
+WA_LGA_BOUNDARIES_GEOJSON_PATH = os.getenv("WA_LGA_BOUNDARIES_GEOJSON_PATH", "")
 
 
 @st.cache_resource
@@ -120,7 +122,7 @@ def load_top_roads(lg_name: str | None, network_type: str | None, limit: int = 2
         SELECT
             COALESCE(NULLIF(TRIM(road_name), ''), 'Unknown') AS road_name,
             COUNT(*)::int AS segment_count,
-            ROUND(SUM(COALESCE(length_m, 0)) / 1000.0, 3) AS total_length_km
+            ROUND((SUM(COALESCE(length_m, 0)) / 1000.0)::numeric, 3) AS total_length_km
         FROM core.road_segment
         {where_clause}
         GROUP BY COALESCE(NULLIF(TRIM(road_name), ''), 'Unknown')
@@ -137,9 +139,7 @@ def load_top_roads(lg_name: str | None, network_type: str | None, limit: int = 2
 @st.cache_data(ttl=300)
 def load_filtered_lga_stats(stat_date: str, selected_networks: list[str]) -> pd.DataFrame:
     if not selected_networks:
-        return pd.DataFrame(
-            columns=["lg_no", "lg_name", "segment_count", "total_length_km"]
-        )
+        return pd.DataFrame(columns=["lg_no", "lg_name", "segment_count", "total_length_km"])
 
     sql = text(
         """
@@ -167,11 +167,23 @@ def load_filtered_lga_stats(stat_date: str, selected_networks: list[str]) -> pd.
 
 @st.cache_data(ttl=300)
 def load_wa_lga_boundaries() -> dict:
+    candidate_paths = []
+    if WA_LGA_BOUNDARIES_GEOJSON_PATH:
+        candidate_paths.append(Path(WA_LGA_BOUNDARIES_GEOJSON_PATH))
+    candidate_paths.append(Path(__file__).resolve().parent / "assets" / "wa_lga_boundaries.geojson")
+
+    for path in candidate_paths:
+        if path.exists():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload.get("type") != "FeatureCollection":
+                raise ValueError(f"Boundary file is not GeoJSON FeatureCollection: {path}")
+            return payload
+
     response = requests.get(
         f"{WA_LGA_BOUNDARIES_URL}/query",
         params={
-            "where": "STE_CODE21='5'",
-            "outFields": "LGA_CODE21,LGA_NAME21",
+            "where": "STATE_CODE_2021='5'",
+            "outFields": "LGA_CODE_2024,LGA_NAME_2024",
             "returnGeometry": "true",
             "outSR": "4326",
             "f": "geojson",
@@ -225,14 +237,18 @@ def build_lga_choropleth_feature_collection(
     features = []
     for feature in boundaries_geojson.get("features", []):
         props = feature.get("properties", {})
-        boundary_code = normalize_lga_code(props.get("LGA_CODE21"))
-        boundary_name = normalize_lga_name(props.get("LGA_NAME21"))
+        geometry = feature.get("geometry")
+        if not geometry:
+            continue
+
+        boundary_code = normalize_lga_code(props.get("LGA_CODE_2024"))
+        boundary_name = normalize_lga_name(props.get("LGA_NAME_2024"))
 
         matched = stats_by_code.get(boundary_code) or stats_by_name.get(boundary_name)
         if matched is None:
             matched = {
-                "lg_no": props.get("LGA_CODE21", ""),
-                "lg_name": props.get("LGA_NAME21", "Unknown"),
+                "lg_no": props.get("LGA_CODE_2024", ""),
+                "lg_name": props.get("LGA_NAME_2024", "Unknown"),
                 "segment_count": 0,
                 "total_length_km": 0.0,
             }
@@ -240,7 +256,7 @@ def build_lga_choropleth_feature_collection(
         features.append(
             {
                 "type": "Feature",
-                "geometry": feature.get("geometry"),
+                "geometry": geometry,
                 "properties": {
                     "lg_no": matched["lg_no"],
                     "lg_name": matched["lg_name"],
@@ -259,7 +275,7 @@ def compute_map_center(feature_collection: dict) -> tuple[float, float]:
 
     def walk_coordinates(node):
         if isinstance(node, list):
-            if node and isinstance(node[0], (int, float)) and len(node) >= 2:
+            if node and isinstance(node[0], int | float) and len(node) >= 2:
                 lon, lat = node[0], node[1]
                 lons.append(lon)
                 lats.append(lat)
@@ -268,8 +284,10 @@ def compute_map_center(feature_collection: dict) -> tuple[float, float]:
                 walk_coordinates(child)
 
     for feature in feature_collection.get("features", []):
-        geom = feature.get("geometry", {})
-        coords = geom.get("coordinates", [])
+        geom = feature.get("geometry") or {}
+        if not isinstance(geom, dict):
+            continue
+        coords = geom.get("coordinates") or []
         walk_coordinates(coords)
 
     if not lats or not lons:
@@ -322,14 +340,16 @@ def make_map(feature_collection: dict) -> folium.Map:
 
     # Dissolve LGAs to show the WA state outline as a distinct boundary layer.
     shapes = [
-        shape(f["geometry"])
-        for f in feature_collection.get("features", [])
-        if f.get("geometry")
+        shape(f["geometry"]) for f in feature_collection.get("features", []) if f.get("geometry")
     ]
     if shapes:
         wa_outline = mapping(unary_union(shapes))
         folium.GeoJson(
-            {"type": "Feature", "geometry": wa_outline, "properties": {"name": "Western Australia"}},
+            {
+                "type": "Feature",
+                "geometry": wa_outline,
+                "properties": {"name": "Western Australia"},
+            },
             style_function=lambda _: {
                 "fillOpacity": 0,
                 "color": "#000000",
@@ -384,8 +404,12 @@ def main():
     else:
         lga_summary_view = lga_summary.copy()
 
-    total_length = float(lga_summary_view["total_length_km"].sum()) if not lga_summary_view.empty else 0.0
-    total_segments = int(lga_summary_view["segment_count"].sum()) if not lga_summary_view.empty else 0
+    total_length = (
+        float(lga_summary_view["total_length_km"].sum()) if not lga_summary_view.empty else 0.0
+    )
+    total_segments = (
+        int(lga_summary_view["segment_count"].sum()) if not lga_summary_view.empty else 0
+    )
     total_lgas = int(lga_summary_view["lg_name"].nunique()) if not lga_summary_view.empty else 0
 
     c1, c2, c3 = st.columns(3)
@@ -457,11 +481,55 @@ def main():
     try:
         wa_boundaries = load_wa_lga_boundaries()
     except Exception as exc:
-        st.error(f"Could not load WA LGA boundaries: {exc}")
+        st.error("Could not load WA LGA boundaries.")
+        st.caption(
+            "Fix: set `WA_LGA_BOUNDARIES_GEOJSON_PATH` to a local GeoJSON file, or override "
+            "`WA_LGA_BOUNDARIES_URL` to a working ArcGIS FeatureServer layer."
+        )
+        st.exception(exc)
     else:
-        feature_collection = build_lga_choropleth_feature_collection(wa_boundaries, lga_summary_view)
-        road_map = make_map(feature_collection)
-        st_folium(road_map, width=None, height=650)
+        boundary_features = wa_boundaries.get("features") or []
+        boundary_count = len(boundary_features) if isinstance(boundary_features, list) else 0
+
+        feature_collection = build_lga_choropleth_feature_collection(
+            wa_boundaries, lga_summary_view
+        )
+        choropleth_features = feature_collection.get("features") or []
+        choropleth_count = len(choropleth_features) if isinstance(choropleth_features, list) else 0
+
+        if choropleth_count == 0:
+            st.warning(
+                "No usable LGA geometries were found for the choropleth "
+                f"(loaded {boundary_count} boundary features, rendered 0)."
+            )
+            st.caption(
+                "This usually means the boundary response has missing/empty geometries or is not GeoJSON. "
+                "Try setting `WA_LGA_BOUNDARIES_GEOJSON_PATH` to a local GeoJSON FeatureCollection, or "
+                "update the `outFields`/property keys used in the join."
+            )
+            with st.expander("Choropleth debug"):
+                sample_props = {}
+                if isinstance(boundary_features, list) and boundary_features:
+                    props = boundary_features[0].get("properties")
+                    if isinstance(props, dict):
+                        sample_props = {k: props.get(k) for k in list(props)[:15]}
+                st.write(
+                    {
+                        "boundary_feature_count": boundary_count,
+                        "choropleth_feature_count": choropleth_count,
+                        "sample_boundary_properties": sample_props,
+                    }
+                )
+
+            road_map = folium.Map(
+                location=[-25.2744, 122.0],
+                zoom_start=6,
+                tiles="CartoDB positron",
+            )
+            st_folium(road_map, width=None, height=650)
+        else:
+            road_map = make_map(feature_collection)
+            st_folium(road_map, width=None, height=650)
 
     st.subheader("LGA statistics table")
     st.dataframe(
