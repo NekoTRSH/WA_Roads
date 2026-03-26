@@ -4,6 +4,13 @@ Traffic in Western Australia, specifically Perth can sometimes be overly complic
 
 ## Run It (Step-by-step)
 
+### Quickstart (recommended)
+```bash
+make venv-install
+make pipeline-ddl
+make dashboard
+```
+
 ### 0) Prereqs
 - Python 3.10+ (3.11 recommended)
 - Docker Desktop (for PostGIS + pgAdmin)
@@ -67,3 +74,10 @@ streamlit run dashboards/streamlit_app.py
 ```
 
 Open the URL Streamlit prints (usually `http://localhost:8501`).
+
+## Pipeline CLI
+The one-shot pipeline runner supports a few useful flags:
+
+- `python src/orchestration/run_pipeline.py --with-docker` (start DB, then ingest→load→transform→checks)
+- `python src/orchestration/run_pipeline.py --with-docker --with-ddl` (also run `sql/ddl/*.sql`)
+- `python src/orchestration/run_pipeline.py --strict-checks` (fail on missing name fields too)

@@ -1,5 +1,21 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+
 .venv/
 venv/
 evn/
 
 __pycache__/
+*.pyc
+
+# Local data outputs
+data/
+*.parquet
+*.geojson
+*.json
+
+# Streamlit / notebooks
+.streamlit/
+.ipynb_checkpoints/
